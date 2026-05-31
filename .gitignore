@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/*.sqlite
+data/*.sqlite-*
+data/master.key
+runtime/
+.env
