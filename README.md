@@ -1,4 +1,4 @@
-# Farofinha Z.ai Proxy
+# ZAI Proxy
 
 Proxy local OpenAI-compatible para usar uma sessao real do `chat.z.ai` com clientes como Zed, OpenAI SDK/Codex e ferramentas que falam `/v1/chat/completions` ou `/v1/responses`.
 
@@ -232,3 +232,38 @@ PROXY_TOOLS_MAX_FILE_BYTES=1048576
 PROXY_TOOLS_MAX_WRITE_BYTES=1048576
 PROXY_TOOLS_MAX_ROUNDS=6
 ```
+
+# Disclaimer
+
+Este projeto foi criado **unicamente para fins de estudo, pesquisa, aprendizado e uso interno**.
+
+A **Z.AI Proxy** não é afiliada, associada, autorizada, endossada ou mantida pela Z.AI, Zhipu AI ou qualquer empresa relacionada.
+
+O objetivo deste repositório é estudar conceitos técnicos como:
+
+- proxies compatíveis com APIs;
+- transformação de payloads;
+- streaming;
+- autenticação;
+- integração entre ferramentas;
+- arquitetura de servidores em TypeScript.
+
+## Aviso de responsabilidade
+
+Este projeto **não tem como objetivo incentivar, orientar ou facilitar abuso de serviços, violação de termos de uso, burlar limites, explorar falhas, revender acesso não autorizado ou prejudicar qualquer plataforma**.
+
+Não compactuo com o uso deste código para atividades indevidas, ilegais, abusivas ou contrárias aos termos de serviço de qualquer provedor.
+
+Qualquer pessoa que utilize este projeto é totalmente responsável pelo próprio uso, incluindo o cumprimento das leis aplicáveis, políticas de uso, termos de serviço e regras das plataformas envolvidas.
+
+## Uso recomendado
+
+Este projeto deve ser utilizado apenas em ambientes controlados, locais, privados ou educacionais, com contas, credenciais e permissões próprias.
+
+Caso você represente alguma empresa, plataforma ou detentor de direitos e tenha qualquer preocupação sobre este repositório, entre em contato para que eu possa analisar e tomar as providências necessárias.
+
+## Sem garantias
+
+Este software é fornecido “como está”, sem garantias de funcionamento, segurança, compatibilidade ou adequação para qualquer finalidade específica.
+
+O autor não se responsabiliza por danos, bloqueios, perdas, mau uso ou consequências decorrentes da utilização deste projeto.
