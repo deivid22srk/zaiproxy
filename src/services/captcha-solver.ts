@@ -102,10 +102,6 @@ export class CaptchaSolver {
       this.session = { ...session, page, preparedAt: 0 };
     }
 
-    if (this.session?.accountId === account.id && Date.now() - this.session.preparedAt < 5 * 60 * 1000) {
-      return page;
-    }
-
     await session.context.addCookies(account.cookies as any).catch(() => {});
     await page.goto(config.zai.baseUrl, { waitUntil: "domcontentloaded" });
     await page.evaluate(
