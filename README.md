@@ -20,6 +20,35 @@ npm run login -- --reuse-profile
 npm run accounts
 ```
 
+### Login no Termux (Android / Linux sem Interface)
+
+No Termux ou ambientes sem interface gráfica (onde o Chromium padrão não pode ser aberto), você tem duas opções para realizar o login:
+
+#### Opção A: Importação Direta via Cookies (Sem Playwright/Chrome)
+Você pode exportar os cookies do Z.ai (em formato JSON) usando extensões como "EditThisCookie" (no Kiwi Browser para Android ou no PC) e importá-los diretamente passando uma URL ou um arquivo local:
+
+```bash
+# Importando os cookies de uma URL
+npm run login -- --cookies https://paste.centos.org/view/raw/9ec45bbb
+
+# Importando de um arquivo local contendo a array JSON dos cookies
+npm run login -- --cookies ./cookies.json
+```
+
+#### Opção B: Login via Navegador com Interface X11 (Debian no Termux)
+Se você estiver rodando o Debian no Termux e possuir um servidor X11 ativo (VNC, Termux-X11, etc.) com a variável `DISPLAY` configurada, basta instalar o Playwright e executar o comando padrão. O script detectará a tela gráfica e abrirá o Chromium visível para você realizar o login no Z.ai:
+
+```bash
+# Certifique-se de que a variável DISPLAY está exportada (ex: :1)
+export DISPLAY=:1
+
+# Instale o playwright caso ainda não tenha instalado
+npm install playwright
+
+# Execute o login padrão que abrirá o navegador no X11
+npm run login
+```
+
 Captcha de uso roda em Chromium headless persistente, com pagina real carregada em segundo plano e cache por conta.
 
 ```bash
