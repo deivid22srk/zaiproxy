@@ -818,10 +818,22 @@ function sanitizeConversationKey(value: string): string {
 
 function normalizeModelId(model: string): string {
   const trimmed = model.trim();
+  let name = trimmed;
   if (trimmed.includes("/")) {
-    return trimmed.split("/").filter(Boolean).at(-1) ?? config.zai.defaultModel;
+    name = trimmed.split("/").filter(Boolean).at(-1) ?? config.zai.defaultModel;
   }
-  return trimmed || config.zai.defaultModel;
+  
+  const lower = name.toLowerCase();
+  if (lower === "glm-5.1") return "GLM-5.1";
+  if (lower === "glm-5-turbo") return "GLM-5-Turbo";
+  if (lower === "glm-5v-turbo") return "GLM-5v-Turbo";
+  if (lower === "glm-5") return "glm-5";
+  if (lower === "glm-4.7") return "glm-4.7";
+  if (lower === "glm-4.6v") return "glm-4.6v";
+  if (lower === "glm-4-flash") return "glm-4-flash";
+  if (lower === "glm-4.5-air" || lower === "glm-4-air") return "glm-4-air-250414";
+  
+  return name;
 }
 
 function shouldRetryWithFreshChat(error: unknown, request: ChatCompletionRequest): boolean {
