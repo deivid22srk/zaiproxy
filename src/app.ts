@@ -10,7 +10,7 @@ import { requestLogger, requireProxyAuth } from "./routes/middleware.js";
 
 export function createApp(container: AppContainer): Hono {
   const app = new Hono();
-  const zai = new ZaiClient(container.accounts);
+  const zai = new ZaiClient(container.accounts, container.conversations);
 
   app.use("*", async (c, next) => {
     const url = new URL(c.req.url);
@@ -25,9 +25,20 @@ export function createApp(container: AppContainer): Hono {
   app.use("*", requestLogger);
   app.get("/", (c) =>
     c.json({
-      service: "glm-zai-proxy",
+      service: `ZAI Proxy ${container.config.version}`,
       openai_compatible: true,
-      routes: ["/health", "/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/proxy/tools"]
+      routes: [
+        "/health",
+        "/v1/models",
+        "/v1/chat/completions",
+        "/v1/chat/completions/stop",
+        "/v1/completions",
+        "/v1/responses",
+        "/v1/responses/stop",
+        "/v1/responses/:id/cancel",
+        "/v1/chat/responses",
+        "/v1/proxy/tools"
+      ]
     })
   );
 
@@ -38,7 +49,7 @@ export function createApp(container: AppContainer): Hono {
   app.route("/v1/models", modelRoutes(zai));
   app.route("/v1", proxyToolRoutes());
   app.route("/v1", chatRoutes(zai));
-  app.route("/v1", responsesRoutes(zai));
+  app.route("/v1", responsesRoutes(zai, container.responses));
 
   return app;
 }

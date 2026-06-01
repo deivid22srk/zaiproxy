@@ -44,6 +44,29 @@ function migrate(db: AppDatabase): void {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS conversations (
+      conversation_key TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      current_message_id TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
+      ON conversations(updated_at);
+
+    CREATE TABLE IF NOT EXISTS response_records (
+      response_id TEXT PRIMARY KEY,
+      conversation_key TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_response_records_updated_at
+      ON response_records(updated_at);
   `);
 
   addColumnIfMissing(db, "accounts", "failure_count", "INTEGER NOT NULL DEFAULT 0");

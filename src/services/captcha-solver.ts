@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { chromium, type BrowserContext, type Page } from "playwright";
+import type { BrowserContext, Page } from "playwright";
 import { config } from "../config/env.js";
 import { ensureDir } from "../lib/paths.js";
 import { logger } from "../lib/logger.js";
@@ -11,11 +11,13 @@ type CaptchaSession = {
   accountId: string;
   context: BrowserContext;
   page: Page;
+  preparedAt: number;
 };
 
 export class CaptchaSolver {
   private readonly solveQueues = new Map<string, Promise<void>>();
   private session: CaptchaSession | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
 
   async solve(account: ZaiAccount): Promise<string> {
     const previous = this.solveQueues.get(account.id) ?? Promise.resolve();
@@ -36,11 +38,13 @@ export class CaptchaSolver {
   }
 
   private async getSession(account: ZaiAccount): Promise<CaptchaSession> {
+    this.clearIdleTimer();
     if (this.session?.accountId === account.id && !this.session.page.isClosed()) {
       return this.session;
     }
 
     await this.closeSession();
+    const { chromium } = await import("playwright");
     const profilePath = ensureDir(join(config.runtimeDir, "captcha-profiles", sanitizeProfileSegment(account.id)));
     logger.warn(
       "AUTH",
@@ -56,6 +60,15 @@ export class CaptchaSolver {
         "--disable-renderer-backgrounding"
       ]
     });
+    await context
+      .route("**/*", (route) => {
+        const type = route.request().resourceType();
+        if (type === "font" || type === "media") {
+          return route.abort();
+        }
+        return route.continue();
+      })
+      .catch(() => {});
 
     context.on("close", () => {
       if (this.session?.context === context) {
@@ -64,11 +77,12 @@ export class CaptchaSolver {
     });
 
     const page = context.pages()[0] ?? (await context.newPage());
-    this.session = { accountId: account.id, context, page };
+    this.session = { accountId: account.id, context, page, preparedAt: 0 };
     return this.session;
   }
 
   private async closeSession(): Promise<void> {
+    this.clearIdleTimer();
     const session = this.session;
     this.session = null;
     if (session) {
@@ -79,7 +93,11 @@ export class CaptchaSolver {
   private async preparePage(session: CaptchaSession, account: ZaiAccount): Promise<Page> {
     const page = session.page.isClosed() ? await session.context.newPage() : session.page;
     if (page !== session.page) {
-      this.session = { ...session, page };
+      this.session = { ...session, page, preparedAt: 0 };
+    }
+
+    if (this.session?.accountId === account.id && Date.now() - this.session.preparedAt < 5 * 60 * 1000) {
+      return page;
     }
 
     await session.context.addCookies(account.cookies as Parameters<typeof session.context.addCookies>[0]).catch(() => {});
@@ -95,7 +113,10 @@ export class CaptchaSolver {
     );
 
     await page.goto(config.zai.baseUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    await page.waitForLoadState("load", { timeout: 10000 }).catch(() => {});
+    if (this.session?.accountId === account.id) {
+      this.session.preparedAt = Date.now();
+    }
     return page;
   }
 
@@ -262,7 +283,24 @@ export class CaptchaSolver {
     } finally {
       if (!config.captcha.keepBrowserOpen) {
         await this.closeSession();
+      } else {
+        this.scheduleIdleClose();
       }
+    }
+  }
+
+  private scheduleIdleClose(): void {
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      void this.closeSession();
+    }, config.captcha.idleTtlMs);
+    this.idleTimer.unref();
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
     }
   }
 }

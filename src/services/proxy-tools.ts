@@ -6,9 +6,11 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { dirname, relative, resolve, sep } from "node:path";
 import { config } from "../config/env.js";
 import type { OpenAIToolCall } from "../types/openai.js";
@@ -162,6 +164,56 @@ export const PROXY_TOOL_SPECS: ToolSpec[] = [
         overwrite: { type: "boolean" }
       }
     }
+  },
+  {
+    name: "delete_path",
+    description: "Delete a file or, with recursive=true, a directory inside the configured project root.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string" },
+        recursive: { type: "boolean", description: "Required for deleting directories." }
+      }
+    }
+  },
+  {
+    name: "stat_path",
+    description: "Return metadata for a file or directory under the configured project root.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string" }
+      }
+    }
+  },
+  {
+    name: "run_command",
+    description:
+      "Run a local command in the configured project root and return stdout, stderr, exit code, and timeout status.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["command"],
+      properties: {
+        command: { type: "string", minLength: 1, description: "Command executable or shell command." },
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional argv list. When provided with shell=false, command is executed without a shell."
+        },
+        cwd: { type: "string", description: "Working directory under the project root. Defaults to root." },
+        shell: { type: "boolean", description: "Defaults to true unless args are provided." },
+        timeout_ms: { type: "integer", minimum: 1000, maximum: 120000 },
+        max_output_chars: { type: "integer", minimum: 1000, maximum: 60000 }
+      }
+    }
   }
 ];
 
@@ -194,6 +246,15 @@ export async function executeProxyToolCall(call: OpenAIToolCall): Promise<string
         break;
       case "move_path":
         result = movePath(args);
+        break;
+      case "delete_path":
+        result = deletePath(args);
+        break;
+      case "stat_path":
+        result = statPath(args);
+        break;
+      case "run_command":
+        result = await runCommand(args);
         break;
       default:
         result = { ok: false, tool: call.function.name, error: `Unknown proxy tool: ${call.function.name}` };
@@ -334,6 +395,110 @@ function movePath(args: Record<string, unknown>): ToolResult {
   mkdirSync(dirname(to.absolute), { recursive: true });
   renameSync(from.absolute, to.absolute);
   return { ok: true, tool: "move_path", data: { from: from.relative, to: to.relative } };
+}
+
+function deletePath(args: Record<string, unknown>): ToolResult {
+  const path = resolveToolPath(requiredString(args.path, "path"), "write");
+  if (path.relative === ".") {
+    throw new Error("Refusing to delete the proxy tool root");
+  }
+  if (!existsSync(path.absolute)) {
+    throw new Error(`Path does not exist: ${path.relative}`);
+  }
+  const stat = lstatSync(path.absolute);
+  if (stat.isDirectory() && args.recursive !== true) {
+    throw new Error(`${path.relative} is a directory; set recursive=true`);
+  }
+  rmSync(path.absolute, { recursive: stat.isDirectory(), force: false });
+  return { ok: true, tool: "delete_path", data: { path: path.relative, type: stat.isDirectory() ? "directory" : "file" } };
+}
+
+function statPath(args: Record<string, unknown>): ToolResult {
+  const path = resolveToolPath(requiredString(args.path, "path"), "read");
+  const stat = lstatSync(path.absolute);
+  return {
+    ok: true,
+    tool: "stat_path",
+    data: {
+      path: path.relative,
+      type: stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other",
+      bytes: stat.size,
+      modified_at: stat.mtime.toISOString()
+    }
+  };
+}
+
+async function runCommand(args: Record<string, unknown>): Promise<ToolResult> {
+  const command = requiredString(args.command, "command");
+  assertCommandAllowed(command);
+  const cwd = resolveToolPath(stringArg(args.cwd, "."), "read");
+  assertDirectory(cwd.absolute);
+  const commandArgs = Array.isArray(args.args) ? args.args.map((item) => String(item)) : [];
+  const shell = typeof args.shell === "boolean" ? args.shell : commandArgs.length === 0;
+  const timeoutMs = clampInt(args.timeout_ms, 1000, 120000, 30000);
+  const maxOutputChars = clampInt(args.max_output_chars, 1000, 60000, 20000);
+  const started = Date.now();
+
+  return await new Promise<ToolResult>((resolveResult) => {
+    const child = spawn(command, commandArgs, {
+      cwd: cwd.absolute,
+      shell,
+      windowsHide: true,
+      env: process.env
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) child.kill("SIGKILL");
+      }, 1000).unref();
+    }, timeoutMs);
+    timer.unref();
+
+    const append = (target: "stdout" | "stderr", chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      if (target === "stdout") {
+        stdout = trimOutput(stdout + text, maxOutputChars);
+      } else {
+        stderr = trimOutput(stderr + text, maxOutputChars);
+      }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolveResult({
+        ok: false,
+        tool: "run_command",
+        error: error.message,
+        data: { command, cwd: cwd.relative, ms: Date.now() - started }
+      });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolveResult({
+        ok: !timedOut && code === 0,
+        tool: "run_command",
+        data: {
+          command,
+          args: commandArgs,
+          cwd: cwd.relative,
+          exit_code: code,
+          signal,
+          timed_out: timedOut,
+          ms: Date.now() - started,
+          stdout,
+          stderr
+        },
+        ...(timedOut ? { error: `Command timed out after ${timeoutMs}ms` } : code === 0 ? {} : { error: `Command exited with ${code}` })
+      });
+    });
+  });
 }
 
 type NormalizedEdit = {
@@ -525,6 +690,30 @@ function assertWriteSize(content: string): void {
   if (bytes > config.tools.maxWriteBytes) {
     throw new Error(`Write payload exceeds ${config.tools.maxWriteBytes} bytes`);
   }
+}
+
+function assertCommandAllowed(command: string): void {
+  const normalized = command.trim();
+  if (!normalized) {
+    throw new Error("command must be a non-empty string");
+  }
+  if (/\b(?:sudo|su)\b/.test(normalized)) {
+    throw new Error("Refusing to run privilege escalation commands");
+  }
+  if (/\b(?:mkfs|fdisk|parted|shutdown|reboot|poweroff)\b/.test(normalized)) {
+    throw new Error("Refusing to run destructive system commands");
+  }
+  if (/(?:^|\s)rm\s+-[^;&|]*r[^;&|]*f[^;&|]*(?:\/|\*)/.test(normalized)) {
+    throw new Error("Refusing to run broad recursive deletion");
+  }
+}
+
+function trimOutput(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  const omitted = value.length - maxChars;
+  return `${value.slice(0, maxChars)}\n[truncated ${omitted} chars]`;
 }
 
 function countOccurrences(content: string, search: string): number {

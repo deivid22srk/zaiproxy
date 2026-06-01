@@ -11,7 +11,7 @@ export async function requestLogger(c: Context, next: Next): Promise<void> {
 }
 
 export async function requireProxyAuth(c: Context, next: Next): Promise<Response | void> {
-  if (!config.proxyApiKey) {
+  if (!config.proxyRequireApiKey || !config.proxyApiKey) {
     return next();
   }
 

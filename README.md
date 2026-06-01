@@ -1,4 +1,4 @@
-# ZAI Proxy
+# Zproxy version 0.2.0
 
 Proxy local OpenAI-compatible para usar uma sessao real do `chat.z.ai` com clientes como Zed, OpenAI SDK/Codex e ferramentas que falam `/v1/chat/completions` ou `/v1/responses`.
 
@@ -35,9 +35,23 @@ CAPTCHA_KEEP_BROWSER_OPEN=false npm start
 - `GET /v1/models?verbose=true`
 - `GET /v1/models/:id`
 - `POST /v1/chat/completions`
+- `POST /v1/chat/completions/stop`
+- `POST /v1/chat/completions/:id/cancel`
+- `POST /v1/chat/completations` (alias tolerante para clientes com typo)
 - `GET /v1/chat/completions/:id`
 - `DELETE /v1/chat/completions/:id`
+- `POST /v1/completions`
+- `POST /v1/completions/stop`
+- `POST /v1/completions/:id/cancel`
+- `POST /v1/completations` (alias tolerante)
+- `POST /v1/completations/stop`
+- `POST /v1/completations/:id/cancel`
 - `POST /v1/responses`
+- `POST /v1/responses/stop`
+- `POST /v1/responses/:id/cancel`
+- `POST /v1/chat/responses`
+- `POST /v1/chat/responses/stop`
+- `POST /v1/chat/responses/:id/cancel`
 - `GET /v1/responses/:id`
 - `DELETE /v1/responses/:id`
 - `GET /v1/proxy/tools`
@@ -58,7 +72,27 @@ Cooldowns de conta sao curtos: erros de limite, captcha rejeitado ou falha tempo
 
 `prompt_cache_key` e usado como chave real de conversa no proxy, evitando criar um chat novo no Z.ai a cada chamada. Sem chave explicita, Chat Completions usa uma conversa padrao por conta/modelo; Responses encadeia pelo `previous_response_id`.
 
+Interrupcao de cliente fecha o stream e aborta a chamada upstream. Clientes que preferem uma rota explicita podem chamar `POST /v1/responses/:id/cancel`, `POST /v1/responses/stop`, `POST /v1/chat/completions/:id/cancel` ou `POST /v1/chat/completions/stop` com `response_id`, `completion_id`, `request_id` ou `id` no corpo.
+
 `parallel_tool_calls`, `tools`, `tool_choice` e `stream_options` sao aceitos para compatibilidade com SDKs e CLIs OpenAI, mas nao sao enviados crus para a API interna da Z.ai. O payload upstream fica no formato observado no navegador da Z.ai para evitar `INTERNAL_ERROR`.
+
+## Instaladores
+
+Linux:
+
+```bash
+./instalador.sh
+```
+
+Windows:
+
+```bat
+instalador.bat
+```
+
+Os instaladores detectam Zed, Codex CLI, OpenCode, Aider e Claude Code. Eles rodam um updater GitHub antes da configuracao, fazem backup dos arquivos alterados e mesclam o provider ZAI Proxy sem remover MCPs, providers ou ajustes existentes. Claude Code e apenas detectado e documentado, porque ele nao consome provider OpenAI-compatible de forma segura.
+
+O updater compara a branch `main` de `https://github.com/AnThophicous/zaiproxy` com o commit local. Se a instalacao estiver mais de 5 commits atrasada ele atualiza por fast-forward automaticamente; com 1 a 5 commits de atraso ele mostra os commits e pergunta antes. Ajustes locais sao preservados com stash temporario quando necessario.
 
 ## Tool calls
 
@@ -110,7 +144,7 @@ Exemplo em `~/.config/zed/settings.json`:
 {
   "language_models": {
     "openai_compatible": {
-      "Farofinha": {
+      "ZAI Proxy": {
         "api_url": "http://127.0.0.1:3000/v1",
         "available_models": [
           {
@@ -141,7 +175,7 @@ Exemplo em `~/.config/zed/settings.json`:
 }
 ```
 
-Se voce definir `PROXY_API_KEY`, use o mesmo valor como chave no cliente. Sem `PROXY_API_KEY`, o proxy aceita qualquer bearer local.
+Por padrao o proxy nao exige chave. Se voce decidir travar acesso depois, defina `PROXY_REQUIRE_API_KEY=true` junto com `PROXY_API_KEY`; ai o proxy passa a aceitar `Authorization: Bearer ...` ou `x-api-key`.
 
 ## OpenAI SDK / Codex
 
@@ -149,7 +183,6 @@ Se voce definir `PROXY_API_KEY`, use o mesmo valor como chave no cliente. Sem `P
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: process.env.FAROFINHA_API_KEY ?? "local",
   baseURL: "http://127.0.0.1:3000/v1"
 });
 
@@ -185,14 +218,13 @@ Config minima esperada:
   "model": "z.ai/GLM-5.1",
   "small_model": "z.ai/GLM-5-Turbo",
   "provider": {
-    "z.ai": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Farofinha Z.ai Proxy",
-      "options": {
-        "baseURL": "http://127.0.0.1:3000/v1",
-        "apiKey": "local"
-      },
-      "models": {
+      "z.ai": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "ZAI Proxy 0.1.0",
+        "options": {
+          "baseURL": "http://127.0.0.1:3000/v1"
+        },
+        "models": {
         "GLM-5.1": { "name": "GLM-5.1" },
         "GLM-5-Turbo": { "name": "GLM-5-Turbo" }
       }
@@ -217,13 +249,18 @@ api_key: local
 HOST=127.0.0.1
 PORT=3000
 PROXY_API_KEY=
+PROXY_REQUIRE_API_KEY=false
 
 ZAI_BASE_URL=https://chat.z.ai
 ZAI_DEFAULT_MODEL=GLM-5.1
+ZAI_HEALTH_CACHE_TTL_MS=30000
+ZAI_MODELS_CACHE_TTL_MS=300000
+ZAI_FETCH_TIMEOUT_MS=10000
 
 CAPTCHA_HEADLESS=true
 CAPTCHA_KEEP_BROWSER_OPEN=true
 CAPTCHA_TIMEOUT_MS=180000
+CAPTCHA_IDLE_TTL_MS=600000
 
 PROXY_NATIVE_TOOLS=true
 PROXY_NATIVE_TOOLS_AUTO=false
@@ -231,6 +268,12 @@ PROXY_TOOLS_ROOT=.
 PROXY_TOOLS_MAX_FILE_BYTES=1048576
 PROXY_TOOLS_MAX_WRITE_BYTES=1048576
 PROXY_TOOLS_MAX_ROUNDS=6
+
+ZAI_PROXY_REMOTE_URL=https://github.com/AnThophicous/zaiproxy.git
+ZAI_PROXY_REMOTE_BRANCH=main
+ZAI_PROXY_BASE_URL=http://127.0.0.1:3000/v1
+ZAI_PROXY_MODEL=GLM-5.1
+ZAI_PROXY_SMALL_MODEL=GLM-5-Turbo
 ```
 
 # Disclaimer

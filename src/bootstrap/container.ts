@@ -1,5 +1,7 @@
 import { AccountRepository } from "../db/accounts.js";
+import { ConversationRepository } from "../db/conversations.js";
 import { openDatabase } from "../db/database.js";
+import { ResponseRepository } from "../db/responses.js";
 import { config, loadOrCreateMasterSecret } from "../config/env.js";
 import { CryptoBox } from "../lib/crypto.js";
 import { logger } from "../lib/logger.js";
@@ -19,11 +21,15 @@ export function createContainer() {
   const crypto = new CryptoBox(loadOrCreateMasterSecret());
   const db = openDatabase();
   const accounts = new AccountRepository(db, crypto);
+  const conversations = new ConversationRepository(db);
+  const responses = new ResponseRepository(db);
 
   return {
     config,
     crypto,
     db,
-    accounts
+    accounts,
+    conversations,
+    responses
   };
 }

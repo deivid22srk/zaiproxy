@@ -1,10 +1,11 @@
-import type { JsonSchema, OpenAIFunctionTool } from "../types/openai.js";
+import type { JsonSchema } from "../types/openai.js";
 
 export type ToolSpec = {
   name: string;
   description: string;
   parameters: JsonSchema;
   strict: boolean;
+  sourceType?: string;
 };
 
 export type ValidationResult =
@@ -18,18 +19,35 @@ export function functionToolsFromUnknown(tools: unknown): ToolSpec[] {
 
   const specs: ToolSpec[] = [];
   for (const tool of tools) {
-    if (!isRecord(tool) || tool.type !== "function") {
+    if (!isRecord(tool)) {
       continue;
     }
-    const fn = (isRecord(tool.function) ? tool.function : tool) as OpenAIFunctionTool["function"];
-    if (typeof fn.name !== "string" || !isToolName(fn.name)) {
+
+    const type = typeof tool.type === "string" ? tool.type : "";
+    if (!["function", "custom", "namespace"].includes(type) && !isRecord(tool.function)) {
       continue;
     }
+
+    const fn = sourceForTool(tool);
+    const name = stringValue(fn.name) ?? stringValue(tool.name);
+    if (!name || !isToolName(name)) continue;
+
+    const schema =
+      schemaValue(fn.parameters) ??
+      schemaValue(fn.inputSchema) ??
+      schemaValue(fn.input_schema) ??
+      schemaValue(fn.schema) ??
+      schemaValue(tool.parameters) ??
+      schemaValue(tool.inputSchema) ??
+      schemaValue(tool.input_schema) ??
+      defaultParametersForTool(type);
+
     specs.push({
-      name: fn.name,
-      description: typeof fn.description === "string" ? fn.description : "",
-      parameters: isRecord(fn.parameters) ? (fn.parameters as JsonSchema) : { type: "object" },
-      strict: Boolean(fn.strict)
+      name,
+      description: stringValue(fn.description) ?? stringValue(tool.description) ?? "",
+      parameters: schema,
+      strict: Boolean(fn.strict ?? tool.strict),
+      sourceType: type || "function"
     });
   }
   return specs;
@@ -167,6 +185,34 @@ function validateSchema(schema: JsonSchema, value: unknown, path: string, errors
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function sourceForTool(tool: Record<string, unknown>): Record<string, unknown> {
+  if (isRecord(tool.function)) return tool.function;
+  if (isRecord(tool.custom)) return tool.custom;
+  return tool;
+}
+
+function schemaValue(value: unknown): JsonSchema | null {
+  return isRecord(value) ? (value as JsonSchema) : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function defaultParametersForTool(type: string): JsonSchema {
+  if (type === "custom") {
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["input"],
+      properties: {
+        input: { type: "string", description: "Raw custom tool input." }
+      }
+    };
+  }
+  return { type: "object", properties: {}, additionalProperties: true };
 }
 
 function matchesType(type: string, value: unknown): boolean {

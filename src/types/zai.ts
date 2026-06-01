@@ -20,9 +20,18 @@ export type ZaiAccount = {
 
 export type ZaiCompletionEvent = {
   type?: string;
+  id?: string;
+  response_id?: string;
+  message_id?: string;
   error?: ZaiCompletionError;
   data?: {
+    id?: string;
+    response_id?: string;
+    message_id?: string;
     data?: {
+      id?: string;
+      response_id?: string;
+      message_id?: string;
       done?: boolean;
       error?: ZaiCompletionError;
     };

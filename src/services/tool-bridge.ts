@@ -19,7 +19,7 @@ import {
   type ToolSpec
 } from "./tool-schema.js";
 import { executeProxyToolCall, PROXY_TOOL_SPECS, proxyToolsRoot } from "./proxy-tools.js";
-import { flattenMessageContent, openAiChunk } from "./openai-transform.js";
+import { flattenMessageContent, openAiChunk, openAiUsageChunk } from "./openai-transform.js";
 
 export type ToolBridgeResult =
   | {
@@ -74,14 +74,15 @@ export async function maybeRunToolBridge(
   return runProxyToolLoop(zai, request, signal);
 }
 
-export function toolBridgeCompletion(request: ChatCompletionRequest, result: ToolBridgeResult) {
-  const id = `chatcmpl-${randomUUID()}`;
+export function toolBridgeCompletion(request: ChatCompletionRequest, result: ToolBridgeResult, id = `chatcmpl-${randomUUID()}`) {
   if (result.kind === "tool_calls") {
     return {
       id,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model: request.model,
+      response_id: id,
+      previous_response_id: request.previous_response_id ?? null,
       system_fingerprint: null,
       choices: [
         {
@@ -105,6 +106,8 @@ export function toolBridgeCompletion(request: ChatCompletionRequest, result: Too
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: request.model,
+    response_id: id,
+    previous_response_id: request.previous_response_id ?? null,
     system_fingerprint: null,
     choices: [
       {
@@ -125,57 +128,90 @@ export function toolBridgeCompletion(request: ChatCompletionRequest, result: Too
   };
 }
 
-export function streamToolBridgeResult(request: ChatCompletionRequest, result: ToolBridgeResult): Response {
-  const id = `chatcmpl-${randomUUID()}`;
+export function streamToolBridgeResult(
+  request: ChatCompletionRequest,
+  result: ToolBridgeResult,
+  id = `chatcmpl-${randomUUID()}`,
+  onDone?: () => void
+): Response {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(encodeSse(openAiChunk(id, request.model, { role: "assistant" })));
+      try {
+        controller.enqueue(encodeSse(openAiChunk(id, request.model, { role: "assistant" })));
 
-      if (result.kind === "tool_calls") {
-        result.toolCalls.forEach((toolCall, index) => {
+        if (result.kind === "tool_calls") {
+          result.toolCalls.forEach((toolCall, index) => {
+            const args = toolCall.function.arguments;
+            controller.enqueue(
+              encodeSse(
+                openAiChunk(id, request.model, {
+                  tool_calls: [
+                    {
+                      index,
+                      id: toolCall.id,
+                      type: "function",
+                      function: {
+                        name: toolCall.function.name,
+                        arguments: ""
+                      }
+                    }
+                  ]
+                })
+              )
+            );
+            for (const fragment of chunkString(args, 4096)) {
+              controller.enqueue(
+                encodeSse(
+                  openAiChunk(id, request.model, {
+                    tool_calls: [
+                      {
+                        index,
+                        function: {
+                          arguments: fragment
+                        }
+                      }
+                    ]
+                  })
+                )
+              );
+            }
+          });
+          controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "tool_calls")));
+          if (request.stream_options?.include_usage) {
+            controller.enqueue(encodeSse(openAiUsageChunk(id, request.model, result.usage)));
+          }
+        } else {
+          if (shouldIncludeReasoning(request) && result.reasoningContent) {
+            controller.enqueue(
+              encodeSse(openAiChunk(id, request.model, { reasoning_content: result.reasoningContent }))
+            );
+          }
+          if (result.content) {
+            controller.enqueue(encodeSse(openAiChunk(id, request.model, { content: result.content })));
+          }
           controller.enqueue(
             encodeSse(
-              openAiChunk(id, request.model, {
-                tool_calls: [
-                  {
-                    index,
-                    id: toolCall.id,
-                    type: "function",
-                    function: {
-                      name: toolCall.function.name,
-                      arguments: toolCall.function.arguments
-                    }
-                  }
-                ]
-              })
+              openAiChunk(
+                id,
+                request.model,
+                {},
+                "stop"
+              )
             )
           );
-        });
-        controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "tool_calls", result.usage)));
-      } else {
-        if (shouldIncludeReasoning(request) && result.reasoningContent) {
-          controller.enqueue(
-            encodeSse(openAiChunk(id, request.model, { reasoning_content: result.reasoningContent }))
-          );
+          if (request.stream_options?.include_usage) {
+            controller.enqueue(encodeSse(openAiUsageChunk(id, request.model, result.usage)));
+          }
         }
-        if (result.content) {
-          controller.enqueue(encodeSse(openAiChunk(id, request.model, { content: result.content })));
-        }
-        controller.enqueue(
-          encodeSse(
-            openAiChunk(
-              id,
-              request.model,
-              {},
-              "stop",
-              request.stream_options?.include_usage ? result.usage : null
-            )
-          )
-        );
-      }
 
-      controller.enqueue(encodeSse("[DONE]"));
-      controller.close();
+        controller.enqueue(encodeSse("[DONE]"));
+        controller.close();
+      } finally {
+        onDone?.();
+      }
+    },
+    cancel() {
+      onDone?.();
     }
   });
 
@@ -342,7 +378,7 @@ function withToolInstructions(
   return {
     ...request,
     stream: true,
-    messages: [{ role: "system", content: instruction }, ...request.messages],
+    messages: [{ role: "developer", content: instruction }, ...request.messages],
     zai: {
       ...request.zai,
       enable_thinking: request.zai?.enable_thinking ?? false
@@ -365,9 +401,11 @@ function buildToolInstruction(
   return [
     "You are connected to an OpenAI-compatible tool bridge.",
     target,
-    "Use tools for filesystem/codebase actions instead of pasting complete files or long patches in plain text.",
-    "When a tool is needed, output only this exact XML-wrapped JSON shape with no Markdown:",
-    '<tool_calls>{"tool_calls":[{"name":"tool_name","arguments":{}}]}</tool_calls>',
+    "You can use the listed tools by emitting tool call JSON; never claim that tool calls are unavailable when a listed tool can satisfy the request.",
+    "Do not execute tools yourself. The proxy or client will execute them after your response is parsed.",
+    "Use tools for filesystem/codebase/actions instead of pasting complete files, command output, or long patches in plain text.",
+    "When a tool is needed, output only this exact JSON shape with no Markdown and no surrounding XML:",
+    '{"tool_calls":[{"type":"function","function":{"name":"tool_name","arguments":{}}}]}',
     "The JSON must be strict: double quotes only, no comments, no trailing commas, arguments must match the schema.",
     maxCalls,
     choice,
@@ -382,8 +420,15 @@ function buildToolInstruction(
 function parseToolCalls(content: string, tools: ToolSpec[]): ParseResult {
   const errors: string[] = [];
   const knownTools = toolMap(tools);
+  const xmlParsed = parseXmlStyleToolCalls(content, tools, knownTools);
+  if (xmlParsed.ok) {
+    return { ok: true, toolCalls: xmlParsed.toolCalls, sawCandidate: true };
+  }
+  if (xmlParsed.sawCandidate) {
+    errors.push(...xmlParsed.errors);
+  }
   const candidates = extractJsonCandidates(content);
-  let sawCandidate = false;
+  let sawCandidate = xmlParsed.sawCandidate;
 
   for (const candidate of candidates) {
     let parsed: unknown;
@@ -441,6 +486,53 @@ function parseToolCalls(content: string, tools: ToolSpec[]): ParseResult {
   return { ok: false, errors, sawCandidate };
 }
 
+function parseXmlStyleToolCalls(
+  content: string,
+  tools: ToolSpec[],
+  knownTools: Map<string, ToolSpec>
+): ParseResult {
+  const errors: string[] = [];
+  const toolCalls: OpenAIToolCall[] = [];
+  let sawCandidate = false;
+  const pattern = /<tool_call\b([^>]*)>([\s\S]*?)(?:<\/tool_call>|$)/gi;
+
+  for (const match of content.matchAll(pattern)) {
+    sawCandidate = true;
+    const attrs = match[1] ?? "";
+    const block = match[2] ?? "";
+    const name = xmlAttribute(attrs, "name") ?? xmlTagValue(block, "name") ?? inferToolNameFromArguments(block, tools);
+    if (!name) {
+      errors.push("tool_call.name: missing function name");
+      continue;
+    }
+    const tool = knownTools.get(name);
+    if (!tool) {
+      errors.push(`tool_call.name: unknown tool ${name}`);
+      continue;
+    }
+
+    const args = xmlArguments(block);
+    const validation = validateToolArguments(tool, args);
+    if (!validation.ok) {
+      errors.push(...validation.errors);
+      continue;
+    }
+    toolCalls.push({
+      id: xmlAttribute(attrs, "id") ?? `call_${randomUUID()}`,
+      type: "function",
+      function: {
+        name,
+        arguments: JSON.stringify(validation.value)
+      }
+    });
+  }
+
+  if (toolCalls.length > 0 && errors.length === 0) {
+    return { ok: true, toolCalls, sawCandidate: true };
+  }
+  return { ok: false, errors, sawCandidate };
+}
+
 function extractJsonCandidates(content: string): string[] {
   const candidates: string[] = [];
   const xmlPattern = /<tool_calls>\s*([\s\S]*?)\s*<\/tool_calls>/gi;
@@ -476,6 +568,76 @@ function extractJsonCandidates(content: string): string[] {
   return [...new Set(candidates)].filter(Boolean);
 }
 
+function xmlAttribute(attrs: string, name: string): string | null {
+  const match = attrs.match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i"));
+  return match?.[1] ? decodeXml(match[1]).trim() : null;
+}
+
+function xmlTagValue(block: string, name: string): string | null {
+  const match = block.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)(?:<\\/${name}>|$)`, "i"));
+  return match?.[1] ? decodeXml(match[1]).trim() : null;
+}
+
+function xmlArguments(block: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  const parameterPattern = /<parameter\b([^>]*)>([\s\S]*?)(?:<\/parameter>|$)/gi;
+  for (const match of block.matchAll(parameterPattern)) {
+    const name = xmlAttribute(match[1] ?? "", "name");
+    if (!name) continue;
+    args[name] = coerceXmlValue(match[2] ?? "");
+  }
+  if (Object.keys(args).length > 0) {
+    return args;
+  }
+
+  const argumentsBlock = xmlTagValue(block, "arguments") ?? xmlTagValue(block, "args") ?? xmlTagValue(block, "parameters");
+  if (argumentsBlock) {
+    const parsed = parseArguments(argumentsBlock);
+    if (parsed.ok) {
+      return parsed.value;
+    }
+  }
+  return args;
+}
+
+function inferToolNameFromArguments(block: string, tools: ToolSpec[]): string | null {
+  const args = xmlArguments(block);
+  const keys = Object.keys(args);
+  if (keys.length === 0) {
+    return null;
+  }
+  const matches = tools.filter((tool) => {
+    const properties = tool.parameters.properties ?? {};
+    return keys.every((key) => key in properties);
+  });
+  return matches.length === 1 ? matches[0]?.name ?? null : null;
+}
+
+function coerceXmlValue(value: string): unknown {
+  const decoded = decodeXml(value).trim();
+  if (decoded === "true") return true;
+  if (decoded === "false") return false;
+  if (decoded === "null") return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(decoded)) return Number(decoded);
+  if ((decoded.startsWith("{") && decoded.endsWith("}")) || (decoded.startsWith("[") && decoded.endsWith("]"))) {
+    try {
+      return JSON.parse(decoded);
+    } catch {
+      return decoded;
+    }
+  }
+  return decoded;
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 function rawToolCalls(parsed: unknown): unknown[] {
   if (Array.isArray(parsed)) return parsed;
   if (!parsed || typeof parsed !== "object") return [];
@@ -499,7 +661,13 @@ function normalizeRawToolCall(
   const record = rawCall as Record<string, unknown>;
   const fn = record.function && typeof record.function === "object" ? (record.function as Record<string, unknown>) : null;
   const name = stringValue(record.name) ?? stringValue(fn?.name);
-  const argsRaw = record.arguments ?? record.args ?? fn?.arguments ?? fn?.args ?? {};
+  const argsRaw =
+    record.arguments ??
+    record.args ??
+    (typeof record.input === "string" ? { input: record.input } : record.input) ??
+    fn?.arguments ??
+    fn?.args ??
+    {};
 
   if (!name) {
     return { ok: false, errors: [`tool_calls[${index}].name: missing function name`] };
@@ -638,6 +806,9 @@ function synthesizeToolCalls(
 
 function selectFilesystemTool(tools: ToolSpec[], prompt: string, modelText: string): ToolSpec | null {
   const combined = `${prompt}\n${modelText}`;
+  if (/(analisa|analisar|olha|inspeciona|inspect|analyze|projeto|project|codebase|workspace|arquivos|files|estrutura|architecture|arquitetura)/i.test(combined)) {
+    return findTool(tools, ["list_directory", "list_dir", "directory_tree", "ls", "glob", "read_file", "grep", "search"]);
+  }
   if (/(crie|create|write|salve|save|arquivo|file|html|c[oó]digo|code)/i.test(combined)) {
     return findTool(tools, ["write_file", "create_file"]);
   }
@@ -667,6 +838,21 @@ function synthesizeArguments(
     if (!pathKey) return null;
     const path = extractDirectoryPath(prompt) ?? extractDirectoryPath(modelText);
     return path ? { [pathKey]: path } : null;
+  }
+
+  if (["list_directory", "list_dir", "directory_tree", "ls"].includes(tool.name)) {
+    const pathKey = firstProperty(tool, ["path", "directory", "dir", "relative_path"]) ?? "path";
+    return { [pathKey]: "." };
+  }
+
+  if (tool.name === "glob") {
+    const patternKey = firstProperty(tool, ["pattern", "glob", "query"]) ?? "pattern";
+    return { [patternKey]: "**/*" };
+  }
+
+  if (["grep", "search"].includes(tool.name)) {
+    const queryKey = firstProperty(tool, ["query", "pattern", "search", "regex"]) ?? "query";
+    return { [queryKey]: latestSearchQuery(prompt) };
   }
 
   return null;
@@ -722,6 +908,11 @@ function extractDirectoryPath(text: string): string | null {
   return labeled?.[1] ?? null;
 }
 
+function latestSearchQuery(text: string): string {
+  const compact = text.trim().replace(/\s+/g, " ");
+  return compact ? compact.slice(0, 120) : ".";
+}
+
 function latestUserText(messages: OpenAIMessage[]): string {
   const latest = [...messages].reverse().find((message) => message.role === "user");
   return latest ? flattenMessageContent(latest) : "";
@@ -758,4 +949,13 @@ function stringValue(value: unknown): string | null {
 
 function shouldIncludeReasoning(request: ChatCompletionRequest): boolean {
   return Boolean(request.zai?.include_reasoning || request.stream_options?.include_reasoning);
+}
+
+function chunkString(value: string, size: number): string[] {
+  if (!value) return [""];
+  const chunks: string[] = [];
+  for (let index = 0; index < value.length; index += size) {
+    chunks.push(value.slice(index, index + size));
+  }
+  return chunks;
 }

@@ -5,3 +5,21 @@ data/*.sqlite-*
 data/master.key
 runtime/
 .env
+
+# env / secrets
+.env.*
+!.env.example
+
+# sessions / cookies / auth
+*cookie*
+*cookies*
+*session*
+*sessions*
+storageState.json
+playwright/.auth/
+
+# local db / secrets
+*.sqlite
+*.sqlite-*
+*.db
+*.key

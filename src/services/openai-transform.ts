@@ -85,18 +85,33 @@ export function openAiChunk(
   };
 }
 
+export function openAiUsageChunk(id: string, model: string, usage: OpenAIUsage | null) {
+  return {
+    id,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    system_fingerprint: null,
+    choices: [],
+    usage
+  };
+}
+
 export function openAiCompletion(
   request: ChatCompletionRequest,
   content: string,
   reasoningContent: string,
   usage: OpenAIUsage | null,
-  options: { includeReasoning?: boolean } = {}
+  options: { includeReasoning?: boolean; id?: string } = {}
 ) {
+  const id = options.id ?? `chatcmpl-${randomUUID()}`;
   return {
-    id: `chatcmpl-${randomUUID()}`,
+    id,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: request.model,
+    response_id: id,
+    previous_response_id: request.previous_response_id ?? null,
     system_fingerprint: null,
     choices: [
       {

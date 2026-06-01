@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../config/env.js";
 import type { AccountRepository } from "../db/accounts.js";
+import type { ConversationRepository } from "../db/conversations.js";
 import { OPENAI_MODELS } from "../constants/models.js";
 import { logger, timing } from "../lib/logger.js";
 import { parseSse } from "../lib/sse.js";
@@ -32,6 +33,9 @@ type CachedConversation = {
   updatedAt: number;
 };
 
+type HealthResult = { ok: boolean; account: string | null; upstream: string; cached?: boolean };
+type ModelList = typeof OPENAI_MODELS;
+
 const CONVERSATION_TTL_MS = 6 * 60 * 60 * 1000;
 
 export class ZaiClient {
@@ -39,8 +43,15 @@ export class ZaiClient {
   private readonly captcha = new CaptchaSolver();
   private readonly conversations = new Map<string, CachedConversation>();
   private readonly conversationLocks = new Map<string, Promise<void>>();
+  private healthCache: { value: HealthResult; expiresAt: number } | null = null;
+  private healthRefresh: Promise<void> | null = null;
+  private modelsCache: { value: ModelList; expiresAt: number } | null = null;
+  private modelsRefresh: Promise<void> | null = null;
 
-  constructor(private readonly accounts: AccountRepository) {
+  constructor(
+    private readonly accounts: AccountRepository,
+    private readonly conversationStore?: ConversationRepository
+  ) {
     this.pool = new AccountPool(accounts);
   }
 
@@ -48,34 +59,92 @@ export class ZaiClient {
     return this.pool.next();
   }
 
-  async health(): Promise<{ ok: boolean; account: string | null; upstream: string }> {
+  async health(): Promise<HealthResult> {
     const account = this.pool.candidates()[0] ?? null;
     if (!account) {
       return { ok: false, account: null, upstream: "missing_session" };
     }
 
+    const now = Date.now();
+    if (this.healthCache && this.healthCache.expiresAt > now) {
+      return { ...this.healthCache.value, cached: true };
+    }
+
+    this.refreshHealth(account);
+    return this.healthCache?.value ?? { ok: true, account: account.email, upstream: "session_loaded" };
+  }
+
+  private refreshHealth(account: ZaiAccount): void {
+    if (this.healthRefresh) {
+      return;
+    }
+
+    this.healthRefresh = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        void this.loadHealth(account).finally(resolve);
+      }, 0);
+      timer.unref();
+    }).finally(() => {
+      this.healthRefresh = null;
+    });
+  }
+
+  private async loadHealth(account: ZaiAccount): Promise<void> {
+    const value = await this.probeHealth(account);
+    this.healthCache = { value, expiresAt: Date.now() + config.zai.healthCacheTtlMs };
+  }
+
+  private async probeHealth(account: ZaiAccount): Promise<HealthResult> {
     try {
-      await this.fetchUpstream(account, "/api/models", { method: "GET" });
+      await this.fetchUpstream(account, "/api/models", {
+        method: "GET",
+        signal: AbortSignal.timeout(config.zai.fetchTimeoutMs)
+      });
       this.pool.reportSuccess(account);
       return { ok: true, account: account.email, upstream: "ok" };
     } catch (error) {
-      this.pool.reportFailure(account, error);
       logger.warn("HEALTH", "Active account validation failed", error);
       return { ok: false, account: account.email, upstream: "unreachable" };
     }
   }
 
-  async listModels() {
+  async listModels(): Promise<ModelList> {
+    const now = Date.now();
+    if (this.modelsCache && this.modelsCache.expiresAt > now) {
+      return this.modelsCache.value;
+    }
+
+    this.refreshModels();
+    return this.modelsCache?.value ?? OPENAI_MODELS;
+  }
+
+  private refreshModels(): void {
+    if (this.modelsRefresh) {
+      return;
+    }
+
+    this.modelsRefresh = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        void this.loadModels().finally(resolve);
+      }, 0);
+      timer.unref();
+    }).finally(() => {
+      this.modelsRefresh = null;
+    });
+  }
+
+  private async loadModels(): Promise<void> {
     const account = this.pool.candidates()[0] ?? null;
     if (!account) {
-      return OPENAI_MODELS;
+      this.modelsCache = { value: OPENAI_MODELS, expiresAt: Date.now() + config.zai.modelsCacheTtlMs };
+      return;
     }
 
     try {
       const upstream = await this.fetchJson<{ data?: Array<Record<string, unknown>> }>(
         account,
         "/api/models",
-        { method: "GET" }
+        { method: "GET", signal: AbortSignal.timeout(config.zai.fetchTimeoutMs) }
       );
       const upstreamModels = (upstream.data ?? [])
         .map((model) => {
@@ -117,13 +186,17 @@ export class ZaiClient {
         .filter((model) => model !== null);
 
       if (upstreamModels.length > 0) {
-        return mergeModels(upstreamModels);
+        this.modelsCache = {
+          value: mergeModels(upstreamModels),
+          expiresAt: Date.now() + config.zai.modelsCacheTtlMs
+        };
+        return;
       }
     } catch (error) {
       logger.warn("UPSTREAM", "Could not load upstream model list; using local catalog", error);
     }
 
-    return OPENAI_MODELS;
+    this.modelsCache = { value: OPENAI_MODELS, expiresAt: Date.now() + config.zai.modelsCacheTtlMs };
   }
 
   async createCompletionStream(
@@ -150,6 +223,29 @@ export class ZaiClient {
     throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "All accounts failed"));
   }
 
+  cancelRequestConversation(request: ChatCompletionRequest): void {
+    const model = normalizeModelId(request.model || config.zai.defaultModel);
+    const raw = conversationRawKey(request);
+    const suffix = `:${model}:${sanitizeConversationKey(raw)}`;
+    let removed = 0;
+    for (const key of this.conversations.keys()) {
+      if (key.endsWith(suffix)) {
+        this.conversations.delete(key);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      logger.info("UPSTREAM", "Dropped cancelled Z.ai conversation cache", { removed, model });
+    }
+    const persistedRemoved = this.conversationStore?.deleteBySuffix(suffix) ?? 0;
+    if (persistedRemoved > 0) {
+      logger.info("UPSTREAM", "Dropped persisted cancelled Z.ai conversation cache", {
+        removed: persistedRemoved,
+        model
+      });
+    }
+  }
+
   private async createCompletionStreamForAccount(
     account: ZaiAccount,
     request: ChatCompletionRequest,
@@ -161,38 +257,33 @@ export class ZaiClient {
       throw new Error("messages must include at least one user message with text content");
     }
     const created = await this.prepareConversation(account, request, model, prompt, signal);
-    const telemetry = this.buildTelemetry(account, created.chatId);
-    const sortedPayload = sortedSignaturePayload(telemetry.base);
-    const signature = computeZaiSignature(sortedPayload, prompt, telemetry.timestamp);
-    const url = `/api/v2/chat/completions?${telemetry.query}&signature_timestamp=${telemetry.timestamp}`;
-    const body = this.buildCompletionPayload(request, model, prompt, created);
     const stopTimer = timing("UPSTREAM", "Z.ai completion request");
 
     try {
-      const response = await this.fetchCompletion(account, url, signature, body, signal);
-      const inspected = await this.inspectInitialCompletion(response);
+      const response = await this.fetchSignedCompletion(account, request, model, prompt, created, signal);
+      let inspected = await this.inspectInitialCompletion(response);
       if (inspected.captchaRequired) {
         if (request.zai?.captcha_verify_param) {
           throw new Error("FRONTEND_CAPTCHA_REQUIRED: Z.ai rejected the captcha verification");
         }
+        await inspected.response.body?.cancel().catch(() => {});
         logger.warn("UPSTREAM", "Z.ai requested frontend captcha; solving and retrying");
         const captcha = await this.captcha.solve(account);
-        return await this.createCompletionStreamForAccount(
-          account,
-          {
-            ...request,
-            zai: {
-              ...request.zai,
-              captcha_verify_param: captcha,
-              force_new_chat: true
-            }
-          },
-          signal
-        );
+        const retryRequest = {
+          ...request,
+          zai: {
+            ...request.zai,
+            captcha_verify_param: captcha
+          }
+        };
+        const retryResponse = await this.fetchSignedCompletion(account, retryRequest, model, prompt, created, signal);
+        inspected = await this.inspectInitialCompletion(retryResponse);
+        if (inspected.captchaRequired) {
+          throw new Error("FRONTEND_CAPTCHA_REQUIRED: Z.ai rejected the captcha verification");
+        }
       }
 
-      this.commitConversation(account, model, created);
-      return inspected.response;
+      return this.persistConversationFromStream(inspected.response, account, model, created);
     } catch (error) {
       if (shouldRetryWithFreshChat(error, request)) {
         this.forgetConversation(created.conversationKey);
@@ -214,6 +305,22 @@ export class ZaiClient {
     } finally {
       stopTimer();
     }
+  }
+
+  private async fetchSignedCompletion(
+    account: ZaiAccount,
+    request: ChatCompletionRequest,
+    model: string,
+    prompt: string,
+    created: CreatedChat,
+    signal: AbortSignal
+  ): Promise<Response> {
+    const telemetry = this.buildTelemetry(account, created.chatId);
+    const sortedPayload = sortedSignaturePayload(telemetry.base);
+    const signature = computeZaiSignature(sortedPayload, prompt, telemetry.timestamp);
+    const url = `/api/v2/chat/completions?${telemetry.query}&signature_timestamp=${telemetry.timestamp}`;
+    const body = this.buildCompletionPayload(request, model, prompt, created);
+    return this.fetchCompletion(account, url, signature, body, signal);
   }
 
   private async fetchCompletion(
@@ -274,6 +381,51 @@ export class ZaiClient {
     return { response: forwarded, captchaRequired: false };
   }
 
+  private persistConversationFromStream(
+    response: Response,
+    account: ZaiAccount,
+    model: string,
+    created: CreatedChat
+  ): Response {
+    if (!response.body) {
+      this.commitConversation(account, model, created);
+      return response;
+    }
+
+    const [observer, forwarded] = response.body.tee();
+    void this.observeCompletionParentId(observer, account, model, created);
+    return new Response(forwarded, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers
+    });
+  }
+
+  private async observeCompletionParentId(
+    stream: ReadableStream<Uint8Array>,
+    account: ZaiAccount,
+    model: string,
+    created: CreatedChat
+  ): Promise<void> {
+    let upstreamMessageId: string | null = null;
+    try {
+      for await (const event of parseSse(stream)) {
+        const parsed = parseZaiEvent(event.data);
+        const candidate = upstreamParentMessageId(parsed);
+        if (candidate) {
+          upstreamMessageId = candidate;
+        }
+        if (parsed?.data?.done || parsed?.data?.phase === "done") {
+          break;
+        }
+      }
+    } catch (error) {
+      logger.warn("UPSTREAM", "Could not observe Z.ai parent message id; using local fallback", error);
+    } finally {
+      this.commitConversation(account, model, created, upstreamMessageId ?? created.assistantMessageId);
+    }
+  }
+
   private async prepareConversation(
     account: ZaiAccount,
     request: ChatCompletionRequest,
@@ -284,9 +436,29 @@ export class ZaiClient {
     const conversationKey = this.conversationKey(account, request, model);
     return this.withConversationLock(conversationKey, async () => {
       this.pruneConversations();
-      const forceNewChat = Boolean(request.zai?.force_new_chat || request.zai?.captcha_verify_param);
-      const cached = this.conversations.get(conversationKey);
+      const forceNewChat = Boolean(request.zai?.force_new_chat);
+      const persisted = this.conversationStore?.get(conversationKey) ?? null;
+      if (persisted && Date.now() - persisted.updatedAt > CONVERSATION_TTL_MS) {
+        this.conversationStore?.delete(conversationKey);
+      }
+      const cached =
+        this.conversations.get(conversationKey) ??
+        (persisted && Date.now() - persisted.updatedAt <= CONVERSATION_TTL_MS
+          ? {
+              accountId: persisted.accountId,
+              model: persisted.model,
+              chatId: persisted.chatId,
+              currentMessageId: persisted.currentMessageId,
+              updatedAt: persisted.updatedAt
+            }
+          : null);
       if (!forceNewChat && cached?.accountId === account.id && cached.model === model) {
+        this.conversations.set(conversationKey, { ...cached, updatedAt: Date.now() });
+        logger.info("UPSTREAM", "Reusing persisted Z.ai conversation", {
+          chat_id: cached.chatId,
+          parent_message_id: cached.currentMessageId,
+          key: publicConversationKey(conversationKey)
+        });
         return {
           chatId: cached.chatId,
           userMessageId: randomUUID(),
@@ -300,35 +472,41 @@ export class ZaiClient {
     });
   }
 
-  private commitConversation(account: ZaiAccount, model: string, created: CreatedChat): void {
-    this.conversations.set(created.conversationKey, {
+  private commitConversation(
+    account: ZaiAccount,
+    model: string,
+    created: CreatedChat,
+    currentMessageId = created.assistantMessageId
+  ): void {
+    const conversation = {
       accountId: account.id,
       model,
       chatId: created.chatId,
-      currentMessageId: created.assistantMessageId,
+      currentMessageId,
       updatedAt: Date.now()
+    };
+    this.conversations.set(created.conversationKey, conversation);
+    this.conversationStore?.save({
+      conversationKey: created.conversationKey,
+      accountId: conversation.accountId,
+      model: conversation.model,
+      chatId: conversation.chatId,
+      currentMessageId: conversation.currentMessageId
+    });
+    logger.info("UPSTREAM", "Persisted Z.ai conversation cursor", {
+      chat_id: conversation.chatId,
+      parent_message_id: conversation.currentMessageId,
+      key: publicConversationKey(created.conversationKey)
     });
   }
 
   private forgetConversation(conversationKey: string): void {
     this.conversations.delete(conversationKey);
+    this.conversationStore?.delete(conversationKey);
   }
 
   private conversationKey(account: ZaiAccount, request: ChatCompletionRequest, model: string): string {
-    const metadataKey = metadataString(request.metadata, [
-      "conversation_id",
-      "thread_id",
-      "session_id",
-      "chat_id"
-    ]);
-    const raw =
-      request.zai?.conversation_key ??
-      request.prompt_cache_key ??
-      metadataKey ??
-      request.previous_response_id ??
-      request.user ??
-      "default";
-
+    const raw = conversationRawKey(request);
     return `${account.id}:${model}:${sanitizeConversationKey(raw)}`;
   }
 
@@ -359,6 +537,7 @@ export class ZaiClient {
         this.conversations.delete(key);
       }
     }
+    this.conversationStore?.pruneOlderThan(now - CONVERSATION_TTL_MS);
   }
 
   private async createChat(
@@ -423,6 +602,10 @@ export class ZaiClient {
       throw new Error("Z.ai did not return a chat id");
     }
 
+    logger.info("UPSTREAM", "Created new Z.ai conversation", {
+      chat_id: chatId,
+      key: publicConversationKey(conversationKey)
+    });
     return { chatId, userMessageId, assistantMessageId, parentMessageId: null, conversationKey };
   }
 
@@ -612,6 +795,23 @@ function metadataString(metadata: Record<string, unknown> | null | undefined, ke
   return null;
 }
 
+function conversationRawKey(request: ChatCompletionRequest): string {
+  const metadataKey = metadataString(request.metadata, [
+    "conversation_id",
+    "thread_id",
+    "session_id",
+    "chat_id"
+  ]);
+  return (
+    request.zai?.conversation_key ??
+    request.prompt_cache_key ??
+    metadataKey ??
+    request.previous_response_id ??
+    request.user ??
+    "default"
+  );
+}
+
 function sanitizeConversationKey(value: string): string {
   return value.trim().slice(0, 160).replace(/[^a-zA-Z0-9_.:@/-]+/g, "_") || "default";
 }
@@ -630,4 +830,47 @@ function shouldRetryWithFreshChat(error: unknown, request: ChatCompletionRequest
   }
   const message = error instanceof Error ? error.message : String(error);
   return /INTERNAL_ERROR|Oops, something went wrong/i.test(message);
+}
+
+function upstreamParentMessageId(event: unknown): string | null {
+  const paths = [
+    ["data", "response_id"],
+    ["data", "message_id"],
+    ["data", "id"],
+    ["response_id"],
+    ["message_id"],
+    ["id"],
+    ["data", "data", "response_id"],
+    ["data", "data", "message_id"],
+    ["data", "data", "id"]
+  ];
+  for (const path of paths) {
+    const value = nestedString(event, path);
+    if (value && looksLikeMessageId(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function nestedString(value: unknown, path: string[]): string | null {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== "object") {
+      return null;
+    }
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === "string" && current.trim() ? current.trim() : null;
+}
+
+function looksLikeMessageId(value: string): boolean {
+  if (!value.trim()) return false;
+  if (/^(chatcmpl|resp|req|chat)_/i.test(value)) return false;
+  return /^[a-zA-Z0-9_.:-]{8,160}$/.test(value);
+}
+
+function publicConversationKey(value: string): string {
+  const parts = value.split(":");
+  return parts.length > 2 ? parts.slice(1).join(":") : value;
 }

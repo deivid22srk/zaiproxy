@@ -21,6 +21,7 @@ const envSchema = z.object({
   HOST: z.string().default("127.0.0.1"),
   PORT: z.coerce.number().int().positive().default(3000),
   PROXY_API_KEY: z.string().optional().default(""),
+  PROXY_REQUIRE_API_KEY: booleanEnv(false),
   ZAI_BASE_URL: z.string().url().default("https://chat.z.ai"),
   ZAI_FE_VERSION: z.string().default("prod-fe-1.1.38"),
   ZAI_REGION: z.string().default("overseas"),
@@ -28,6 +29,9 @@ const envSchema = z.object({
   ZAI_ACCEPT_LANGUAGE: z.string().default("en-US"),
   ZAI_TIMEZONE: z.string().default("America/Sao_Paulo"),
   ZAI_DEFAULT_MODEL: z.string().default("GLM-5.1"),
+  ZAI_HEALTH_CACHE_TTL_MS: z.coerce.number().int().positive().default(30000),
+  ZAI_MODELS_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
+  ZAI_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   DATA_DIR: z.string().default("./data"),
   RUNTIME_DIR: z.string().default("./runtime"),
   DATABASE_PATH: z.string().default("./data/proxy.sqlite"),
@@ -35,6 +39,7 @@ const envSchema = z.object({
   CAPTCHA_HEADLESS: booleanEnv(true),
   CAPTCHA_KEEP_BROWSER_OPEN: booleanEnv(true),
   CAPTCHA_TIMEOUT_MS: z.coerce.number().int().positive().default(180000),
+  CAPTCHA_IDLE_TTL_MS: z.coerce.number().int().positive().default(600000),
   PROXY_NATIVE_TOOLS: booleanEnv(true),
   PROXY_NATIVE_TOOLS_AUTO: booleanEnv(false),
   PROXY_TOOLS_ROOT: z.string().default("."),
@@ -51,9 +56,11 @@ function resolvePath(path: string): string {
 }
 
 export const config = {
+  version: readPackageVersion(),
   host: parsed.HOST,
   port: parsed.PORT,
   proxyApiKey: parsed.PROXY_API_KEY,
+  proxyRequireApiKey: parsed.PROXY_REQUIRE_API_KEY,
   zai: {
     baseUrl: parsed.ZAI_BASE_URL.replace(/\/$/, ""),
     feVersion: parsed.ZAI_FE_VERSION,
@@ -61,7 +68,10 @@ export const config = {
     language: parsed.ZAI_LANGUAGE,
     acceptLanguage: parsed.ZAI_ACCEPT_LANGUAGE,
     timezone: parsed.ZAI_TIMEZONE,
-    defaultModel: parsed.ZAI_DEFAULT_MODEL
+    defaultModel: parsed.ZAI_DEFAULT_MODEL,
+    healthCacheTtlMs: parsed.ZAI_HEALTH_CACHE_TTL_MS,
+    modelsCacheTtlMs: parsed.ZAI_MODELS_CACHE_TTL_MS,
+    fetchTimeoutMs: parsed.ZAI_FETCH_TIMEOUT_MS
   },
   dataDir: ensureDir(resolvePath(parsed.DATA_DIR)),
   runtimeDir: ensureDir(resolvePath(parsed.RUNTIME_DIR)),
@@ -70,7 +80,8 @@ export const config = {
   captcha: {
     headless: parsed.CAPTCHA_HEADLESS,
     keepBrowserOpen: parsed.CAPTCHA_KEEP_BROWSER_OPEN,
-    timeoutMs: parsed.CAPTCHA_TIMEOUT_MS
+    timeoutMs: parsed.CAPTCHA_TIMEOUT_MS,
+    idleTtlMs: parsed.CAPTCHA_IDLE_TTL_MS
   },
   tools: {
     nativeEnabled: parsed.PROXY_NATIVE_TOOLS,
@@ -82,6 +93,15 @@ export const config = {
   },
   envMasterKey: parsed.GLM_PROXY_MASTER_KEY
 } as const;
+
+function readPackageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(projectPath("package.json"), "utf8")) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 export function loadOrCreateMasterSecret(): string {
   if (config.envMasterKey?.trim()) {
