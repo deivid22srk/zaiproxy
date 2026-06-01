@@ -36,18 +36,36 @@ npm run login -- --cookies ./cookies.json
 ```
 
 #### Opção B: Login via Navegador com Interface X11 (Debian no Termux)
-Se você estiver rodando o Debian no Termux e possuir um servidor X11 ativo (VNC, Termux-X11, etc.) com a variável `DISPLAY` configurada, basta instalar o Playwright e executar o comando padrão. O script detectará a tela gráfica e abrirá o Chromium visível para você realizar o login no Z.ai:
+Se você estiver rodando o Debian no Termux e possuir um servidor X11 ativo (como Termux-X11 ou VNC), você pode abrir o Chromium visível para fazer login. Siga o passo a passo:
 
-```bash
-# Certifique-se de que a variável DISPLAY está exportada (ex: :1)
-export DISPLAY=:1
+1. No **Termux principal** (fora do Debian), inicie o seu servidor gráfico e libere permissões de conexão:
+   ```bash
+   # Para Termux-X11: abra o app Termux-X11 no celular e rode:
+   termux-x11 :1 &
 
-# Instale o playwright caso ainda não tenha instalado
-npm install playwright
+   # Ou para VNC:
+   vncserver :1
 
-# Execute o login padrão que abrirá o navegador no X11
-npm run login
-```
+   # Libere as permissões de acesso ao display :1:
+   xhost +
+   ```
+
+2. Acesse o seu Debian compartilhando a pasta `/tmp` do Termux para o contêiner enxergar o servidor gráfico:
+   ```bash
+   proot-distro login debian --shared-tmp
+   ```
+
+3. Dentro do contêiner Debian, instale as dependências (se necessário), configure a variável do display e inicie o login:
+   ```bash
+   # Garanta que a variável DISPLAY está exportada para o canal correto
+   export DISPLAY=:1
+
+   # Instale o playwright caso ainda não tenha instalado
+   npm install playwright
+
+   # Execute o login padrão (abrirá o Chromium no seu app X11/VNC)
+   npm run login
+   ```
 
 Captcha de uso roda em Chromium headless persistente, com pagina real carregada em segundo plano e cache por conta.
 
