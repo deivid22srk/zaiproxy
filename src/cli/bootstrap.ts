@@ -19,6 +19,7 @@ function parseArgs(args: string[]) {
     allowGuest?: boolean;
     freshProfile?: boolean;
     reuseProfile?: boolean;
+    cookies?: string;
   } = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -41,6 +42,17 @@ function parseArgs(args: string[]) {
       options.freshProfile = true;
     } else if (arg === "--reuse-profile") {
       options.reuseProfile = true;
+    } else if (arg === "--cookies") {
+      const value = args[index + 1];
+      if (value) {
+        options.cookies = value;
+      }
+      index += 1;
+    } else if (arg.startsWith("--cookies=")) {
+      options.cookies = arg.slice("--cookies=".length);
+    } else if (!arg.startsWith("-")) {
+      // Treat positional argument as cookies source if it is not a flag
+      options.cookies = arg;
     }
   }
   return options;
