@@ -23,7 +23,7 @@ const envSchema = z.object({
   PROXY_API_KEY: z.string().optional().default(""),
   PROXY_REQUIRE_API_KEY: booleanEnv(false),
   ZAI_BASE_URL: z.string().url().default("https://chat.z.ai"),
-  ZAI_FE_VERSION: z.string().default("prod-fe-1.1.38"),
+  ZAI_FE_VERSION: z.string().default("prod-fe-1.1.39"),
   ZAI_REGION: z.string().default("overseas"),
   ZAI_LANGUAGE: z.string().default("pt-BR"),
   ZAI_ACCEPT_LANGUAGE: z.string().default("en-US"),
